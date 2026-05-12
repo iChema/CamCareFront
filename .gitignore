@@ -1,0 +1,20 @@
+# Node
+node_modules/
+dist/
+
+# Env
+.env
+.env.*
+!.env.example
+
+# Build/cache
+*.log
+*.tsbuildinfo
+
+# Local debug artifacts
+playwright_*.png
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
