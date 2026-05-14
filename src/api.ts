@@ -20,6 +20,10 @@ export function setApiToken(token: string) {
   authToken = token;
 }
 
+export function getApiToken() {
+  return authToken;
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(`${API_BASE}${path}`, {
     headers: {
@@ -157,5 +161,42 @@ export const api = {
       body: JSON.stringify({ fps }),
     }),
   sterenWebrtcSession: () => request<TuyaWebrtcSession>("/api/tuya/steren/webrtc-session"),
-  streamUrl: (id: number) => `${API_BASE}/api/cameras/${id}/stream.m3u8`,
+  streamUrl: (id: number, profile: "low" | "high" = "low", token = "") =>
+    `${API_BASE}/api/cameras/${id}/stream.m3u8?profile=${profile}${token ? `&token=${encodeURIComponent(token)}` : ""}`,
+  go2rtcStreamUrl: (id: number, profile: "low" | "high" = "low", ticket = "") => {
+    const src = `cam_${id}_${profile}`;
+    const tokenPart = ticket ? `&ticket=${encodeURIComponent(ticket)}` : "";
+    return `${API_BASE}/live/api/stream.m3u8?src=${encodeURIComponent(src)}${tokenPart}`;
+  },
+  go2rtcMp4Url: (id: number, profile: "low" | "high" = "low", ticket = "") => {
+    const src = `cam_${id}_${profile}`;
+    const tokenPart = ticket ? `&ticket=${encodeURIComponent(ticket)}` : "";
+    return `${API_BASE}/live/api/stream.mp4?src=${encodeURIComponent(src)}${tokenPart}`;
+  },
+  liveTicket: (payload: { client_id: string; camera_ids: number[]; preferred_transport: string }) =>
+    request<{
+      live_ticket: string;
+      expires_at: number;
+      ws_base_url: string;
+      transport_mode: string;
+      max_sessions_per_user: number;
+    }>("/api/live/ticket", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
+  liveHeartbeat: (live_ticket: string) =>
+    request<{
+      live_ticket: string;
+      expires_at: number;
+      ws_base_url: string;
+      transport_mode: string;
+      max_sessions_per_user: number;
+    }>("/api/live/heartbeat", {
+      method: "POST",
+      body: JSON.stringify({ live_ticket }),
+    }),
+  closeLiveSession: (clientId: string) =>
+    request<{ ok: boolean; removed: number }>(`/api/live/session/${encodeURIComponent(clientId)}`, {
+      method: "DELETE",
+    }),
 };

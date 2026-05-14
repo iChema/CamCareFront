@@ -1,13 +1,9 @@
-import { StrictMode, useEffect, useMemo, useRef, useState } from "react";
+import { StrictMode, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { createRoot } from "react-dom/client";
 import Hls from "hls.js";
 import {
   Activity,
-  ArrowDown,
-  ArrowLeft,
-  ArrowRight,
-  ArrowUp,
   Camera as CameraIcon,
   Bot,
   ExternalLink,
@@ -26,12 +22,14 @@ import {
   Video,
   Wifi,
   X,
-  ZoomIn,
-  ZoomOut,
 } from "lucide-react";
 import { api } from "./api";
 import { setApiToken } from "./api";
 import type { Camera, CameraProtocol, Health, PtzDirection, ScanResult, TelegramTarget, UserPublic } from "./types";
+import { TelegramTargetsPage } from "./components/TelegramTargetsPage";
+import { Panel, SectionTitle } from "./components/ui";
+import { CameraCard } from "./components/CameraCard";
+import "./tailwind.css";
 import "./styles.css";
 
 type CameraFormPayload = {
@@ -47,6 +45,7 @@ type CameraFormPayload = {
   snapshot_url: string;
   dvr_channel: number | null;
   video_filter: string;
+  use_substream: boolean;
   dashboard_visible: boolean;
   dashboard_order: number;
   ai_person_detection: boolean;
@@ -71,6 +70,7 @@ const emptyCamera: CameraFormPayload = {
   snapshot_url: "",
   dvr_channel: null,
   video_filter: "",
+  use_substream: false,
   dashboard_visible: true,
   dashboard_order: 0,
   ai_person_detection: false,
@@ -99,14 +99,36 @@ type DashboardFilter = "visible" | "all" | "hidden";
 type DashboardSort = "custom" | "name" | "status" | "provider" | "ip" | "ai";
 const CAMERA_PROVIDER_OPTIONS = ["ICSee", "O-KAM", "DVR", "Esee Cloud", "Steren", "CamCare Bridge", "Otro"] as const;
 
+function isLikelyLocalAccess() {
+  if (typeof window === "undefined") return true;
+  const host = window.location.hostname;
+  if (host === "localhost" || host === "127.0.0.1" || host === "::1") return true;
+  if (/^10\./.test(host)) return true;
+  if (/^192\.168\./.test(host)) return true;
+  if (/^172\.(1[6-9]|2[0-9]|3[0-1])\./.test(host)) return true;
+  return false;
+}
+
 function HlsVideo({
-  cameraId,
+  sourceUrl,
+  fallbackUrl,
+  authToken,
   className,
   onError,
+  onHealthy,
+  reloadToken,
+  profile = "low",
+  startDelayMs = 0,
 }: {
-  cameraId: number;
+  sourceUrl: string;
+  fallbackUrl?: string;
+  authToken?: string;
   className?: string;
   onError: (message: string) => void;
+  onHealthy?: () => void;
+  reloadToken?: number;
+  profile?: "low" | "high";
+  startDelayMs?: number;
 }) {
   const videoRef = useRef<HTMLVideoElement | null>(null);
 
@@ -117,13 +139,21 @@ function HlsVideo({
     let retryTimer: number | null = null;
     let retries = 0;
     let cancelled = false;
+    let activeUrl = sourceUrl;
+    let switchedToFallback = false;
+    const maxRetries = profile === "high" ? 4 : 3;
 
     const scheduleRetry = () => {
       if (cancelled) return;
+      if (retries >= maxRetries) {
+        onError("Stream paused after repeated failures");
+        return;
+      }
       retries += 1;
-      const waitMs = Math.min(4000, 800 + retries * 400);
+      const backoff = [2000, 4000, 8000, 15000, 30000];
+      const waitMs = backoff[Math.min(retries - 1, backoff.length - 1)];
       retryTimer = window.setTimeout(() => {
-        start();
+        void start();
       }, waitMs);
     };
 
@@ -147,15 +177,47 @@ function HlsVideo({
       });
     };
 
-    const start = () => {
+    const start = async () => {
       if (cancelled) return;
       cleanupPlayer();
-      const url = `${api.streamUrl(cameraId)}?ts=${Date.now()}`;
+      const legacyFallbackUrl = fallbackUrl || "";
+      const url = activeUrl;
+
+      if (url.includes("/api/stream.mp4")) {
+        video.src = url;
+        tryPlay();
+        onHealthy?.();
+        video.onerror = () => {
+          if (legacyFallbackUrl && !switchedToFallback) {
+            switchedToFallback = true;
+            activeUrl = legacyFallbackUrl;
+            retries = 0;
+            void start();
+            return;
+          }
+          // Fallback to legacy HLS when MP4 live stream fails.
+          if (legacyFallbackUrl && switchedToFallback) {
+            video.src = legacyFallbackUrl;
+            tryPlay();
+          }
+          scheduleRetry();
+        };
+        return;
+      }
 
       if (video.canPlayType("application/vnd.apple.mpegurl")) {
         video.src = url;
         tryPlay();
+        onHealthy?.();
         video.onerror = () => {
+          if (legacyFallbackUrl && !switchedToFallback) {
+            switchedToFallback = true;
+            activeUrl = legacyFallbackUrl;
+            retries = 0;
+            void start();
+            return;
+          }
+          onError("Error de stream");
           scheduleRetry();
         };
         return;
@@ -167,33 +229,72 @@ function HlsVideo({
       }
 
       hls = new Hls({
-        lowLatencyMode: true,
+        lowLatencyMode: false,
+        manifestLoadingMaxRetry: 1,
+        levelLoadingMaxRetry: 1,
+        fragLoadingMaxRetry: 1,
+        manifestLoadingRetryDelay: 1500,
+        levelLoadingRetryDelay: 1500,
+        fragLoadingRetryDelay: 1500,
+        xhrSetup: (xhr) => {
+          if (authToken) xhr.setRequestHeader("Authorization", `Bearer ${authToken}`);
+        },
       });
       hls.loadSource(url);
       hls.attachMedia(video);
       hls.on(Hls.Events.MANIFEST_PARSED, () => {
         retries = 0;
+        onHealthy?.();
         tryPlay();
       });
       hls.on(Hls.Events.ERROR, (_, data) => {
         if (!data.fatal) return;
+        if (legacyFallbackUrl && !switchedToFallback) {
+          switchedToFallback = true;
+          activeUrl = legacyFallbackUrl;
+          retries = 0;
+          void start();
+          return;
+        }
+        onError(`Stream error (${data.type})`);
         scheduleRetry();
       });
     };
 
-    start();
+    const bootTimer = window.setTimeout(() => {
+      void start();
+    }, Math.max(0, startDelayMs));
     return () => {
       cancelled = true;
+      window.clearTimeout(bootTimer);
       cleanupPlayer();
     };
-  }, [cameraId, onError]);
+  }, [sourceUrl, fallbackUrl, authToken, reloadToken, profile, startDelayMs]);
 
   return <video ref={videoRef} className={className} muted playsInline controls autoPlay />;
 }
 
-function StreamTile({ camera }: { camera: Camera }) {
+function StreamTile({
+  camera,
+  liveTicket,
+  authToken,
+  reloadToken,
+  startDelayMs,
+  onStreamFailedChange,
+  fullscreenCameraId,
+  onFullscreenCameraChange,
+}: {
+  camera: Camera;
+  liveTicket?: string;
+  authToken?: string;
+  reloadToken?: number;
+  startDelayMs?: number;
+  onStreamFailedChange?: (cameraId: number, failed: boolean) => void;
+  fullscreenCameraId: number | null;
+  onFullscreenCameraChange: (cameraId: number | null) => void;
+}) {
   const bridgeBaseUrl = "http://127.0.0.1:5090";
-  const [playing, setPlaying] = useState(false);
+  const playing = true;
   const [bridgePlaying, setBridgePlaying] = useState(false);
   const [fullscreen, setFullscreen] = useState(false);
   const [error, setError] = useState("");
@@ -205,6 +306,30 @@ function StreamTile({ camera }: { camera: Camera }) {
     (/steren/i.test(camera.name) || /ismartlife/i.test(camera.host) || /protect-us/i.test(camera.snapshot_url));
   const cloudUrl =
     camera.snapshot_url || (/^https?:\/\//i.test(camera.host) ? camera.host : "");
+  const pausedByAnotherFullscreen = fullscreenCameraId !== null && fullscreenCameraId !== camera.id;
+  const streamToken = liveTicket || authToken || "";
+  const lowUrl = api.streamUrl(camera.id, "low", streamToken);
+  const highUrl = api.streamUrl(camera.id, "high", streamToken);
+  const handleStreamError = useCallback((message: string) => {
+    setError(message);
+  }, []);
+  const handleStreamHealthy = useCallback(() => {
+    setError("");
+  }, []);
+
+  useEffect(() => {
+    onStreamFailedChange?.(camera.id, Boolean(error));
+  }, [camera.id, error, onStreamFailedChange]);
+
+  function openFullscreen() {
+    setFullscreen(true);
+    onFullscreenCameraChange(camera.id);
+  }
+
+  function closeFullscreen() {
+    setFullscreen(false);
+    onFullscreenCameraChange(null);
+  }
 
   useEffect(() => {
     if (!isSterenCloud) return;
@@ -230,12 +355,14 @@ function StreamTile({ camera }: { camera: Camera }) {
   useEffect(() => {
     if (!fullscreen) return;
     const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape") setFullscreen(false);
+      if (event.key === "Escape") closeFullscreen();
     };
     document.body.classList.add("no-scroll");
+    document.body.classList.add("hide-app-header");
     window.addEventListener("keydown", onKeyDown);
     return () => {
       document.body.classList.remove("no-scroll");
+      document.body.classList.remove("hide-app-header");
       window.removeEventListener("keydown", onKeyDown);
     };
   }, [fullscreen]);
@@ -262,7 +389,7 @@ function StreamTile({ camera }: { camera: Camera }) {
 
   async function stopBridge() {
     setBridgePlaying(false);
-    setFullscreen(false);
+    closeFullscreen();
     setBridgeBusy(true);
     try {
       const data = await api.sterenBridgeStop();
@@ -309,7 +436,7 @@ function StreamTile({ camera }: { camera: Camera }) {
                     Detener
                   </button>
                 )}
-                <button className="secondary" onClick={() => setFullscreen(false)}>
+                <button className="secondary" onClick={closeFullscreen}>
                   <X size={16} />
                   Cerrar
                 </button>
@@ -319,7 +446,16 @@ function StreamTile({ camera }: { camera: Camera }) {
               {isSterenCloud ? (
                 <img className="fullscreen-media" src={`${bridgeBaseUrl}/stream.mjpeg`} alt={camera.name} />
               ) : (
-                <HlsVideo cameraId={camera.id} className="fullscreen-media" onError={setError} />
+                <HlsVideo
+                  sourceUrl={highUrl}
+                  fallbackUrl={lowUrl}
+                  className="fullscreen-media"
+                  authToken={authToken}
+                  onError={handleStreamError}
+                  onHealthy={handleStreamHealthy}
+                  reloadToken={reloadToken}
+                  profile="high"
+                />
               )}
             </div>
           </div>,
@@ -335,7 +471,7 @@ function StreamTile({ camera }: { camera: Camera }) {
             <img className="bridge-stream" src={`${bridgeBaseUrl}/stream.mjpeg`} alt={camera.name} />
             <button
               className="fullscreen-open bridge-fullscreen"
-              onClick={() => setFullscreen(true)}
+              onClick={openFullscreen}
               title="Pantalla completa interna"
             >
               <Maximize2 size={16} />
@@ -401,21 +537,40 @@ function StreamTile({ camera }: { camera: Camera }) {
     );
   }
 
+  if (pausedByAnotherFullscreen) {
+    return (
+      <div className="stream-tile">
+        <button className="stream-placeholder" disabled title="Pausado mientras otra cámara está en fullscreen">
+          <Eye size={24} />
+          <span>Pausado por fullscreen</span>
+        </button>
+      </div>
+    );
+  }
+
   return (
     <div className={`stream-tile ${camera.dvr_channel ? "dvr-stretch" : ""}`}>
-      {playing ? (
-        <>
-          <HlsVideo cameraId={camera.id} onError={setError} />
-          <button className="fullscreen-open" onClick={() => setFullscreen(true)} title="Pantalla completa interna">
-            <Maximize2 size={16} />
-          </button>
-        </>
+      {!fullscreen ? (
+        <HlsVideo
+          sourceUrl={lowUrl}
+          fallbackUrl={highUrl}
+          className="bridge-stream"
+          authToken={authToken}
+          onError={handleStreamError}
+          onHealthy={handleStreamHealthy}
+          reloadToken={reloadToken}
+          profile="low"
+          startDelayMs={startDelayMs}
+        />
       ) : (
-        <button className="stream-placeholder" onClick={() => setPlaying(true)}>
+        <button className="stream-placeholder" disabled>
           <Eye size={24} />
-          <span>Ver live</span>
+          <span>Fullscreen activo</span>
         </button>
       )}
+      <button className="fullscreen-open" onClick={openFullscreen} title="Pantalla completa interna">
+        <Maximize2 size={16} />
+      </button>
       {error && <div className="tile-error">{error}</div>}
       {fullscreenOverlay}
     </div>
@@ -675,9 +830,6 @@ function App() {
   const [userModalPassword, setUserModalPassword] = useState("");
   const [userModalRole, setUserModalRole] = useState("viewer");
   const [userModalActive, setUserModalActive] = useState(true);
-  const [tgName, setTgName] = useState("");
-  const [tgChatId, setTgChatId] = useState("");
-  const [tgActive, setTgActive] = useState(true);
   const storedDefaults =
     typeof window !== "undefined" ? window.localStorage.getItem("camcare_defaults_v1") : null;
   const parsedDefaults = storedDefaults ? (JSON.parse(storedDefaults) as Partial<GlobalDefaults>) : {};
@@ -694,7 +846,7 @@ function App() {
   });
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(false);
-  const [screen, setScreen] = useState<"dashboard" | "scan" | "settings" | "users">("dashboard");
+  const [screen, setScreen] = useState<"dashboard" | "scan" | "settings" | "users" | "telegram">("dashboard");
   const [health, setHealth] = useState<Health | null>(null);
   const [cameras, setCameras] = useState<Camera[]>([]);
   const [scanResults, setScanResults] = useState<ScanResult[]>([]);
@@ -703,6 +855,11 @@ function App() {
   const [deep, setDeep] = useState(false);
   const [busy, setBusy] = useState("");
   const [message, setMessage] = useState("");
+  const [streamReloadToken, setStreamReloadToken] = useState(0);
+  const [failedStreamIds, setFailedStreamIds] = useState<Record<number, boolean>>({});
+  const [fullscreenCameraId, setFullscreenCameraId] = useState<number | null>(null);
+  const [liveTicket, setLiveTicket] = useState("");
+  const [liveClientId] = useState(() => `web-${Math.random().toString(36).slice(2, 10)}`);
   const [ptzSpeed, setPtzSpeed] = useState<Record<number, number>>({});
   const [ptzPreset, setPtzPreset] = useState<Record<number, number>>({});
   const [ptzVisible, setPtzVisible] = useState<Record<number, boolean>>({});
@@ -764,6 +921,12 @@ function App() {
     setCameras(nextCameras);
   }
 
+  async function refreshAndReloadStreams() {
+    await refresh();
+    const hasFailures = Object.values(failedStreamIds).some(Boolean);
+    if (hasFailures) setStreamReloadToken(Date.now());
+  }
+
   useEffect(() => {
     if (!authToken) return;
     void api
@@ -775,6 +938,56 @@ function App() {
         setAuthToken("");
       });
   }, [authToken]);
+
+  const visibleCameraIdsKey = useMemo(
+    () =>
+      cameras
+        .filter((camera) => camera.dashboard_visible)
+        .map((camera) => camera.id)
+        .sort((a, b) => a - b)
+        .join(","),
+    [cameras],
+  );
+
+  useEffect(() => {
+    if (!authToken || !currentUser) return;
+    const visibleIds = cameras.filter((camera) => camera.dashboard_visible).map((camera) => camera.id);
+    if (visibleIds.length === 0) return;
+    let cancelled = false;
+    let timer: number | null = null;
+    let currentLiveTicket = "";
+
+    async function bootstrapLiveTicket() {
+      try {
+        const ticket = await api.liveTicket({
+          client_id: liveClientId,
+          camera_ids: visibleIds,
+          preferred_transport: "mse",
+        });
+        if (cancelled) return;
+        currentLiveTicket = ticket.live_ticket;
+        setLiveTicket(currentLiveTicket);
+        timer = window.setInterval(async () => {
+          try {
+            const hb = await api.liveHeartbeat(currentLiveTicket);
+            currentLiveTicket = hb.live_ticket;
+            if (!cancelled) setLiveTicket(currentLiveTicket);
+          } catch {
+            // keep playing; ticket will be recreated on next effect run
+          }
+        }, 45_000);
+      } catch {
+        if (!cancelled) setLiveTicket("");
+      }
+    }
+
+    void bootstrapLiveTicket();
+    return () => {
+      cancelled = true;
+      if (timer) window.clearInterval(timer);
+      void api.closeLiveSession(liveClientId).catch(() => undefined);
+    };
+  }, [authToken, currentUser, liveClientId, visibleCameraIdsKey]);
 
   async function refreshUsers() {
     if (!currentUser || currentUser.role !== "admin") return;
@@ -942,22 +1155,19 @@ function App() {
     }
   }
 
-  async function createTelegramTargetRow() {
-    if (!tgName.trim() || !tgChatId.trim()) {
+  async function createTelegramTargetRow(payload: { name: string; chat_id: string; active: boolean }) {
+    if (!payload.name.trim() || !payload.chat_id.trim()) {
       setMessage("Nombre y chat_id son obligatorios");
       return;
     }
     setBusy("tg-create");
     try {
       await api.createTelegramTarget({
-        name: tgName.trim(),
-        chat_id: tgChatId.trim(),
-        active: tgActive,
+        name: payload.name.trim(),
+        chat_id: payload.chat_id.trim(),
+        active: payload.active,
       });
       await refreshTelegramTargets();
-      setTgName("");
-      setTgChatId("");
-      setTgActive(true);
       setMessage("Destino Telegram agregado");
     } catch (err) {
       setMessage(err instanceof Error ? err.message : "No se pudo agregar destino Telegram");
@@ -1053,7 +1263,7 @@ function App() {
     }
   }
 
-  function openScreen(next: "dashboard" | "scan" | "settings" | "users") {
+  function openScreen(next: "dashboard" | "scan" | "settings" | "users" | "telegram") {
     setScreen(next);
     setSidebarOpen(false);
   }
@@ -1096,12 +1306,12 @@ function App() {
   }
 
   return (
-    <main className={`app-shell ${sidebarCollapsed ? "sidebar-collapsed" : ""}`}>
-      <button className="sidebar-mobile-toggle" onClick={() => setSidebarOpen((current) => !current)}>
+    <main className={`app-shell min-h-screen ${sidebarCollapsed ? "sidebar-collapsed" : ""}`}>
+      <button className="sidebar-mobile-toggle fixed left-2.5 top-2.5 z-[70] inline-flex h-9 w-9 items-center justify-center rounded-lg border border-slate-400/25 bg-slate-950/85 text-slate-200 md:hidden" onClick={() => setSidebarOpen((current) => !current)}>
         <Menu size={18} />
       </button>
-      <aside className={`sidebar ${sidebarOpen ? "open" : ""}`}>
-        <button className="sidebar-toggle" onClick={() => setSidebarCollapsed((current) => !current)}>
+      <aside className={`sidebar ${sidebarOpen ? "open" : ""} border-r border-slate-400/20 bg-slate-950/80 backdrop-blur-xl`}>
+        <button className="sidebar-toggle ml-auto mb-2.5 inline-flex h-8 w-8 items-center justify-center rounded-lg border border-slate-400/25 bg-slate-900/70 text-slate-200" onClick={() => setSidebarCollapsed((current) => !current)}>
           {sidebarCollapsed ? <PanelLeftOpen size={16} /> : <PanelLeftClose size={16} />}
         </button>
         <div className="brand">
@@ -1126,6 +1336,11 @@ function App() {
             </button>
           )}
           {isAdmin && (
+            <button className={screen === "telegram" ? "active" : ""} onClick={() => openScreen("telegram")}>
+              <Bot size={17} /> Telegram
+            </button>
+          )}
+          {isAdmin && (
             <button className={screen === "settings" ? "active" : ""} onClick={() => openScreen("settings")}>
               <Settings size={17} /> Configuración
             </button>
@@ -1133,13 +1348,13 @@ function App() {
         </nav>
       </aside>
 
-      <section className="content">
-        <header>
+      <section className="content w-full px-4 pb-4 pt-14 md:px-7 md:pt-7">
+        <header className="mb-4 grid grid-cols-1 gap-4 md:flex md:items-start md:justify-between">
           <div>
             <h1>Todas tus cámaras, una vista local.</h1>
             <p>DVR + cámaras por apps chinas, reunidas cuando expongan stream LAN.</p>
           </div>
-          <div className="header-actions">
+          <div className="header-actions flex flex-wrap items-center justify-end gap-2">
             <span className="pill ok">{currentUser.email} · {currentUser.role}</span>
             {isAdmin && (
               <button className="secondary" onClick={() => setShowAddCameraModal(true)}>
@@ -1147,7 +1362,7 @@ function App() {
                 Alta manual
               </button>
             )}
-            <button className="secondary" onClick={() => void refresh()}>
+            <button className="secondary" onClick={() => void refreshAndReloadStreams()}>
               <RefreshCw size={16} />
               Refrescar
             </button>
@@ -1159,24 +1374,24 @@ function App() {
 
         <HealthBar health={health} />
 
-        <section className="stats">
-          <div>
+        <section className="stats my-4 grid grid-cols-1 gap-3 md:grid-cols-5">
+          <div className="rounded-lg border border-slate-400/20 bg-slate-900/70 p-4 shadow-2xl">
             <span>Total</span>
             <strong>{cameras.length}</strong>
           </div>
-          <div>
+          <div className="rounded-lg border border-slate-400/20 bg-slate-900/70 p-4 shadow-2xl">
             <span>Dashboard</span>
             <strong>{visibleCount}</strong>
           </div>
-          <div>
+          <div className="rounded-lg border border-slate-400/20 bg-slate-900/70 p-4 shadow-2xl">
             <span>Online</span>
             <strong>{onlineCount}</strong>
           </div>
-          <div>
+          <div className="rounded-lg border border-slate-400/20 bg-slate-900/70 p-4 shadow-2xl">
             <span>IA personas</span>
             <strong>{aiCount}</strong>
           </div>
-          <div>
+          <div className="rounded-lg border border-slate-400/20 bg-slate-900/70 p-4 shadow-2xl">
             <span>Backend</span>
             <strong>{health?.ok ? "OK" : "OFF"}</strong>
           </div>
@@ -1186,12 +1401,9 @@ function App() {
 
         {screen === "dashboard" ? (
           <>
-            <section id="cameras" className="panel">
-          <div className="section-title">
-            <h2>Cámaras</h2>
-            <span>{dashboardCameras.length} visibles de {cameras.length}</span>
-          </div>
-          <div className="dashboard-controls">
+            <Panel id="cameras">
+          <SectionTitle title="Cámaras" meta={`${dashboardCameras.length} visibles de ${cameras.length}`} />
+          <div className="dashboard-controls mb-3 flex flex-wrap items-end gap-3">
             <label>
               Mostrar
               <select value={dashboardFilter} onChange={(event) => setDashboardFilter(event.target.value as DashboardFilter)}>
@@ -1212,201 +1424,40 @@ function App() {
               </select>
             </label>
           </div>
-          <div className="camera-grid">
+          <div className="camera-grid grid grid-cols-1 gap-3 xl:grid-cols-3">
             {dashboardCameras.map((camera) => (
-              <article className="camera-card" key={camera.id}>
-                <StreamTile camera={camera} />
-                <div className="camera-meta">
-                  <div>
-                    <h3>{camera.name}</h3>
-                    <p>{camera.location || camera.provider || camera.host}</p>
-                  </div>
-                  <span className={`status ${camera.protocol === "cloud" ? "app_only" : camera.status}`}>
-                    {camera.protocol === "cloud" ? "cloud" : camera.status}
-                  </span>
-                </div>
-                <div className="camera-detail">
-                  {isAdmin ? (
-                    <>
-                      <span>{camera.host}:{camera.port}</span>
-                      <span>{camera.protocol === "cloud" ? camera.snapshot_url : camera.rtsp_path}</span>
-                    </>
-                  ) : (
-                    <span>{camera.location || camera.provider || "Cámara"}</span>
-                  )}
-                </div>
-                {isAdmin && (
-                  <div className="camera-config">
-                    <label>
-                      Dashboard
-                      <select
-                        value={camera.dashboard_visible ? "show" : "hide"}
-                        disabled={busy === `config-${camera.id}`}
-                        onChange={(event) =>
-                          void updateCameraConfig(camera, { dashboard_visible: event.target.value === "show" })
-                        }
-                      >
-                        <option value="show">Mostrar</option>
-                        <option value="hide">Ocultar</option>
-                      </select>
-                    </label>
-                    <label>
-                      Orden
-                      <select
-                        value={camera.dashboard_order || camera.id}
-                        disabled={busy === `config-${camera.id}`}
-                        onChange={(event) =>
-                          void updateCameraConfig(camera, { dashboard_order: Number(event.target.value) })
-                        }
-                      >
-                        {orderSlots.map((value) => (
-                          <option key={value} value={value}>
-                            {value}
-                          </option>
-                        ))}
-                      </select>
-                    </label>
-                    <label>
-                      IA personas
-                      <select
-                        value={camera.ai_person_detection ? "yes" : "no"}
-                        disabled={busy === `config-${camera.id}`}
-                        onChange={(event) =>
-                          void updateCameraConfig(camera, { ai_person_detection: event.target.value === "yes" })
-                        }
-                      >
-                        <option value="no">No</option>
-                        <option value="yes">Sí</option>
-                      </select>
-                    </label>
-                    {camera.ai_person_detection && (
-                      <span className="ai-badge">
-                        <Bot size={14} />
-                        IA
-                      </span>
-                    )}
-                  </div>
-                )}
-                {isAdmin && camera.protocol !== "cloud" && (
-                  <>
-                    <div className="actions">
-                      <button
-                        className="secondary"
-                        onClick={() => setPtzVisible((prev) => ({ ...prev, [camera.id]: !prev[camera.id] }))}
-                      >
-                        {ptzVisible[camera.id] ? "Ocultar controles" : "Mostrar controles"}
-                      </button>
-                    </div>
-                    {ptzVisible[camera.id] && (
-                      <>
-                        <div className="ptz-grid">
-                          <button
-                            className="secondary ptz-btn"
-                            disabled={busy.startsWith(`ptz-${camera.id}-`)}
-                            onClick={() => void ptz(camera, "up")}
-                            title="PTZ arriba"
-                          >
-                            <ArrowUp size={15} />
-                          </button>
-                          <button
-                            className="secondary ptz-btn"
-                            disabled={busy.startsWith(`ptz-${camera.id}-`)}
-                            onClick={() => void ptz(camera, "zoom_in")}
-                            title="Zoom +"
-                          >
-                            <ZoomIn size={15} />
-                          </button>
-                          <button
-                            className="secondary ptz-btn"
-                            disabled={busy.startsWith(`ptz-${camera.id}-`)}
-                            onClick={() => void ptz(camera, "left")}
-                            title="PTZ izquierda"
-                          >
-                            <ArrowLeft size={15} />
-                          </button>
-                          <button
-                            className="secondary ptz-btn"
-                            disabled={busy.startsWith(`ptz-${camera.id}-`)}
-                            onClick={() => void ptz(camera, "right")}
-                            title="PTZ derecha"
-                          >
-                            <ArrowRight size={15} />
-                          </button>
-                          <button
-                            className="secondary ptz-btn"
-                            disabled={busy.startsWith(`ptz-${camera.id}-`)}
-                            onClick={() => void ptz(camera, "down")}
-                            title="PTZ abajo"
-                          >
-                            <ArrowDown size={15} />
-                          </button>
-                          <button
-                            className="secondary ptz-btn"
-                            disabled={busy.startsWith(`ptz-${camera.id}-`)}
-                            onClick={() => void ptz(camera, "zoom_out")}
-                            title="Zoom -"
-                          >
-                            <ZoomOut size={15} />
-                          </button>
-                        </div>
-                        <div className="ptz-config">
-                          <label>
-                            Velocidad
-                            <input
-                              type="number"
-                              min="1"
-                              max="8"
-                              value={ptzSpeed[camera.id] ?? 4}
-                              onChange={(event) =>
-                                setPtzSpeed((prev) => ({ ...prev, [camera.id]: Number(event.target.value) || 4 }))
-                              }
-                            />
-                          </label>
-                          <label>
-                            Preset
-                            <input
-                              type="number"
-                              min="1"
-                              max="255"
-                              value={ptzPreset[camera.id] ?? 1}
-                              onChange={(event) =>
-                                setPtzPreset((prev) => ({ ...prev, [camera.id]: Number(event.target.value) || 1 }))
-                              }
-                            />
-                          </label>
-                          <button
-                            className="secondary"
-                            disabled={busy.startsWith(`preset-${camera.id}-`)}
-                            onClick={() => void preset(camera, "set")}
-                            title="Guardar preset"
-                          >
-                            Guardar
-                          </button>
-                          <button
-                            className="secondary"
-                            disabled={busy.startsWith(`preset-${camera.id}-`)}
-                            onClick={() => void preset(camera, "goto")}
-                            title="Ir a preset"
-                          >
-                            Ir
-                          </button>
-                        </div>
-                      </>
-                    )}
-                  </>
-                )}
-                {isAdmin && camera.last_error && camera.protocol !== "cloud" && <div className="tile-error">{camera.last_error}</div>}
-                {isAdmin && (
-                  <div className="actions">
-                    <button className="secondary" disabled={busy === `probe-${camera.id}`} onClick={() => void probe(camera)}>
-                      <Activity size={15} /> Probar
-                    </button>
-                    <button className="danger" onClick={() => void remove(camera)}>
-                      <Trash2 size={15} /> Borrar
-                    </button>
-                  </div>
-                )}
-              </article>
+              <CameraCard
+                key={camera.id}
+                camera={camera}
+                isAdmin={isAdmin}
+                busy={busy}
+                orderSlots={orderSlots}
+                ptzVisible={ptzVisible}
+                ptzSpeed={ptzSpeed}
+                ptzPreset={ptzPreset}
+                onTogglePtzVisible={(cameraId) => setPtzVisible((prev) => ({ ...prev, [cameraId]: !prev[cameraId] }))}
+                onSetPtzSpeed={(cameraId, speed) => setPtzSpeed((prev) => ({ ...prev, [cameraId]: speed }))}
+                onSetPtzPreset={(cameraId, slot) => setPtzPreset((prev) => ({ ...prev, [cameraId]: slot }))}
+                onUpdateCameraConfig={updateCameraConfig}
+                onPtz={ptz}
+                onPreset={preset}
+                onProbe={probe}
+                onRemove={remove}
+                streamTile={
+                  <StreamTile
+                    camera={camera}
+                    liveTicket={liveTicket}
+                    authToken={authToken}
+                    reloadToken={failedStreamIds[camera.id] ? streamReloadToken : undefined}
+                    startDelayMs={Math.min(4000, ((camera.dashboard_order || camera.id) % 20) * 250)}
+                    onStreamFailedChange={(cameraId, failed) =>
+                      setFailedStreamIds((prev) => ({ ...prev, [cameraId]: failed }))
+                    }
+                    fullscreenCameraId={fullscreenCameraId}
+                    onFullscreenCameraChange={setFullscreenCameraId}
+                  />
+                }
+              />
             ))}
             {dashboardCameras.length === 0 && (
               <div className="empty">
@@ -1415,14 +1466,14 @@ function App() {
               </div>
             )}
           </div>
-            </section>
+            </Panel>
 
           </>
         ) : screen === "scan" ? (
           isAdmin ? (
-            <section id="scan" className="panel split">
+            <section id="scan" className="panel split my-4 rounded-lg border border-slate-400/20 bg-slate-900/70 p-4 shadow-2xl">
               <div>
-                <div className="section-title">
+                <div className="section-title mb-3 flex items-center justify-between gap-4">
                   <h2>Scan LAN</h2>
                   <span>{scanResults.length} resultados</span>
                 </div>
@@ -1456,7 +1507,7 @@ function App() {
               </div>
             </section>
           ) : (
-            <section className="panel">
+            <section className="panel my-4 rounded-lg border border-slate-400/20 bg-slate-900/70 p-4 shadow-2xl">
               <div className="empty">
                 <p>No autorizado.</p>
               </div>
@@ -1464,11 +1515,8 @@ function App() {
           )
         ) : screen === "users" ? (
           isAdmin ? (
-            <section id="users" className="panel">
-              <div className="section-title">
-                <h2>Usuarios y perfiles</h2>
-                <span>{users.length} usuarios</span>
-              </div>
+            <Panel id="users">
+              <SectionTitle title="Usuarios y perfiles" meta={`${users.length} usuarios`} />
               <div className="actions">
                 <button className="secondary" onClick={() => openCreateUserModal()}>
                   <Plus size={14} />
@@ -1507,20 +1555,33 @@ function App() {
                   </tbody>
                 </table>
               </div>
-            </section>
+            </Panel>
           ) : (
-            <section className="panel">
+            <section className="panel my-4 rounded-lg border border-slate-400/20 bg-slate-900/70 p-4 shadow-2xl">
+              <div className="empty">
+                <p>No autorizado.</p>
+              </div>
+            </section>
+          )
+        ) : screen === "telegram" ? (
+          isAdmin ? (
+            <TelegramTargetsPage
+              telegramTargets={telegramTargets}
+              busy={busy}
+              onCreate={createTelegramTargetRow}
+              onUpdate={updateTelegramTargetRow}
+              onDelete={deleteTelegramTargetRow}
+            />
+          ) : (
+            <section className="panel my-4 rounded-lg border border-slate-400/20 bg-slate-900/70 p-4 shadow-2xl">
               <div className="empty">
                 <p>No autorizado.</p>
               </div>
             </section>
           )
         ) : isAdmin ? (
-          <section id="settings" className="panel">
-            <div className="section-title">
-              <h2>Configuración</h2>
-              <span>{cameras.length} cámaras</span>
-            </div>
+          <Panel id="settings">
+            <SectionTitle title="Configuración" meta={`${cameras.length} cámaras`} />
             <div className="settings-layout">
               <div className="settings-defaults">
                 <h3>Defaults globales</h3>
@@ -1644,80 +1705,6 @@ function App() {
                 </div>
               </div>
               <div className="settings-cameras">
-                <h3>Destinos Telegram</h3>
-                <div className="form-grid settings-grid">
-                  <label>
-                    Nombre
-                    <input value={tgName} onChange={(event) => setTgName(event.target.value)} placeholder="Chema personal" />
-                  </label>
-                  <label>
-                    Chat ID
-                    <input value={tgChatId} onChange={(event) => setTgChatId(event.target.value)} placeholder="136859922 o -100..." />
-                  </label>
-                  <label>
-                    Activo
-                    <select value={tgActive ? "yes" : "no"} onChange={(event) => setTgActive(event.target.value === "yes")}>
-                      <option value="yes">Sí</option>
-                      <option value="no">No</option>
-                    </select>
-                  </label>
-                </div>
-                <div className="actions">
-                  <button className="secondary" disabled={busy === "tg-create"} onClick={() => void createTelegramTargetRow()}>
-                    Agregar destino Telegram
-                  </button>
-                </div>
-                <div className="table-wrap">
-                  <table className="simple-table">
-                    <thead>
-                      <tr>
-                        <th>ID</th>
-                        <th>Nombre</th>
-                        <th>Chat ID</th>
-                        <th>Activo</th>
-                        <th>Acciones</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {telegramTargets.map((target) => (
-                        <tr key={`tg-${target.id}`}>
-                          <td>{target.id}</td>
-                          <td>
-                            <input
-                              value={target.name}
-                              onChange={(event) => setTelegramTargets((current) => current.map((item) => item.id === target.id ? { ...item, name: event.target.value } : item))}
-                            />
-                          </td>
-                          <td>
-                            <input
-                              value={target.chat_id}
-                              onChange={(event) => setTelegramTargets((current) => current.map((item) => item.id === target.id ? { ...item, chat_id: event.target.value } : item))}
-                            />
-                          </td>
-                          <td>
-                            <select
-                              value={target.active ? "yes" : "no"}
-                              onChange={(event) => setTelegramTargets((current) => current.map((item) => item.id === target.id ? { ...item, active: event.target.value === "yes" } : item))}
-                            >
-                              <option value="yes">Sí</option>
-                              <option value="no">No</option>
-                            </select>
-                          </td>
-                          <td>
-                            <div className="row-actions">
-                              <button className="secondary" disabled={busy === `tg-${target.id}`} onClick={() => void updateTelegramTargetRow(target, target)}>
-                                Guardar
-                              </button>
-                              <button className="danger" disabled={busy === `tg-del-${target.id}`} onClick={() => void deleteTelegramTargetRow(target)}>
-                                Borrar
-                              </button>
-                            </div>
-                          </td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
                 <h3>Configuración individual por cámara</h3>
                 <div className="settings-camera-list">
                   {cameras.map((camera) => (
@@ -1759,6 +1746,11 @@ function App() {
                             <option value="">Ninguno</option><option value="crop_top_half">Top half</option><option value="crop_bottom_half">Bottom half</option>
                           </select>
                         </label>
+                        <label>Substream
+                          <select value={camera.use_substream ? "yes" : "no"} onChange={(event) => void updateCameraConfig(camera, { use_substream: event.target.value === "yes" })}>
+                            <option value="no">No</option><option value="yes">Sí</option>
+                          </select>
+                        </label>
                         <label>Dashboard
                           <select value={camera.dashboard_visible ? "show" : "hide"} onChange={(event) => void updateCameraConfig(camera, { dashboard_visible: event.target.value === "show" })}>
                             <option value="show">Mostrar</option><option value="hide">Ocultar</option>
@@ -1785,9 +1777,9 @@ function App() {
                 </div>
               </div>
             </div>
-          </section>
+          </Panel>
         ) : (
-          <section className="panel">
+          <section className="panel my-4 rounded-lg border border-slate-400/20 bg-slate-900/70 p-4 shadow-2xl">
             <div className="empty">
               <p>No autorizado.</p>
             </div>
@@ -1796,7 +1788,7 @@ function App() {
         {isAdmin && showUserModal && (
           <div className="modal-backdrop" role="presentation" onClick={() => setShowUserModal(false)}>
             <div className="modal-card" role="dialog" aria-modal="true" aria-label="Usuario" onClick={(event) => event.stopPropagation()}>
-              <div className="section-title">
+              <div className="section-title mb-3 flex items-center justify-between gap-4">
                 <h2>{editingUserId === null ? "Agregar usuario" : `Editar usuario #${editingUserId}`}</h2>
                 <button className="secondary" onClick={() => setShowUserModal(false)}>
                   <X size={14} />
@@ -1861,7 +1853,7 @@ function App() {
         {isAdmin && showAddCameraModal && (
           <div className="modal-backdrop" role="presentation" onClick={() => setShowAddCameraModal(false)}>
             <div className="modal-card" role="dialog" aria-modal="true" aria-label="Alta manual" onClick={(event) => event.stopPropagation()}>
-              <div className="section-title">
+              <div className="section-title mb-3 flex items-center justify-between gap-4">
                 <h2>Alta manual</h2>
                 <button className="secondary" onClick={() => setShowAddCameraModal(false)}>
                   <X size={14} />

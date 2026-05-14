@@ -15,6 +15,7 @@ export interface Camera {
   snapshot_url: string;
   dvr_channel: number | null;
   video_filter: string;
+  use_substream: boolean;
   dashboard_visible: boolean;
   dashboard_order: number;
   ai_person_detection: boolean;
