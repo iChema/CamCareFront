@@ -137,24 +137,46 @@ function HlsVideo({
     const video = videoRef.current;
     let hls: Hls | null = null;
     let retryTimer: number | null = null;
+    let stallTimer: number | null = null;
     let retries = 0;
     let cancelled = false;
     let activeUrl = sourceUrl;
     let switchedToFallback = false;
-    const maxRetries = profile === "high" ? 4 : 3;
-
+    let lastVideoTime = 0;
+    let lastAdvanceAt = Date.now();
     const scheduleRetry = () => {
       if (cancelled) return;
-      if (retries >= maxRetries) {
-        onError("Stream paused after repeated failures");
-        return;
-      }
+      if (retryTimer) return;
       retries += 1;
-      const backoff = [2000, 4000, 8000, 15000, 30000];
+      const backoff = [1500, 3000, 5000, 8000, 12000];
       const waitMs = backoff[Math.min(retries - 1, backoff.length - 1)];
+      onError(`Reconectando stream… intento ${retries}`);
       retryTimer = window.setTimeout(() => {
+        retryTimer = null;
         void start();
       }, waitMs);
+    };
+
+    const onTimeUpdate = () => {
+      const t = video.currentTime;
+      if (t > lastVideoTime + 0.01) {
+        const hadStall = retries > 0;
+        lastVideoTime = t;
+        lastAdvanceAt = Date.now();
+        if (hadStall) {
+          retries = 0;
+          onHealthy?.();
+        }
+      }
+    };
+
+    const onVideoStalled = () => {
+      if (cancelled) return;
+      // iOS Safari emits transient waiting/suspend often; only reconnect on real freeze.
+      const idleMs = Date.now() - lastAdvanceAt;
+      if (idleMs < 12000) return;
+      onError("Stream congelado, reconectando…");
+      scheduleRetry();
     };
 
     const cleanupPlayer = () => {
@@ -162,6 +184,12 @@ function HlsVideo({
         window.clearTimeout(retryTimer);
         retryTimer = null;
       }
+      if (stallTimer) {
+        window.clearInterval(stallTimer);
+        stallTimer = null;
+      }
+      video.removeEventListener("timeupdate", onTimeUpdate);
+      video.removeEventListener("stalled", onVideoStalled);
       hls?.destroy();
       hls = null;
       video.pause();
@@ -180,6 +208,18 @@ function HlsVideo({
     const start = async () => {
       if (cancelled) return;
       cleanupPlayer();
+      lastVideoTime = 0;
+      lastAdvanceAt = Date.now();
+      video.addEventListener("timeupdate", onTimeUpdate);
+      video.addEventListener("stalled", onVideoStalled);
+      stallTimer = window.setInterval(() => {
+        if (cancelled || video.paused) return;
+        const idleMs = Date.now() - lastAdvanceAt;
+        if (video.readyState >= 2 && idleMs > 12000) {
+          onError("Stream congelado, reconectando…");
+          scheduleRetry();
+        }
+      }, 4000);
       const legacyFallbackUrl = fallbackUrl || "";
       const url = activeUrl;
 
@@ -229,7 +269,11 @@ function HlsVideo({
       }
 
       hls = new Hls({
-        lowLatencyMode: false,
+        lowLatencyMode: true,
+        liveSyncDurationCount: 1,
+        liveMaxLatencyDurationCount: 3,
+        maxBufferLength: 6,
+        backBufferLength: 10,
         manifestLoadingMaxRetry: 1,
         levelLoadingMaxRetry: 1,
         fragLoadingMaxRetry: 1,
@@ -283,6 +327,9 @@ function StreamTile({
   onStreamFailedChange,
   fullscreenCameraId,
   onFullscreenCameraChange,
+  streamEnabled = true,
+  onEnableStream,
+  onDisableStream,
 }: {
   camera: Camera;
   liveTicket?: string;
@@ -292,6 +339,9 @@ function StreamTile({
   onStreamFailedChange?: (cameraId: number, failed: boolean) => void;
   fullscreenCameraId: number | null;
   onFullscreenCameraChange: (cameraId: number | null) => void;
+  streamEnabled?: boolean;
+  onEnableStream?: (cameraId: number) => void;
+  onDisableStream?: (cameraId: number) => void;
 }) {
   const bridgeBaseUrl = "http://127.0.0.1:5090";
   const playing = true;
@@ -463,6 +513,17 @@ function StreamTile({
         )
       : null;
 
+  if (!streamEnabled) {
+    return (
+      <div className="stream-tile">
+        <button className="stream-placeholder" onClick={() => onEnableStream?.(camera.id)} title="Activar stream">
+          <Eye size={24} />
+          <span>Ver live</span>
+        </button>
+      </div>
+    );
+  }
+
   if (camera.protocol === "cloud") {
     if (isSterenCloud) {
       if (bridgePlaying) {
@@ -570,6 +631,9 @@ function StreamTile({
       )}
       <button className="fullscreen-open" onClick={openFullscreen} title="Pantalla completa interna">
         <Maximize2 size={16} />
+      </button>
+      <button className="stream-stop" onClick={() => onDisableStream?.(camera.id)} title="Apagar stream">
+        Apagar
       </button>
       {error && <div className="tile-error">{error}</div>}
       {fullscreenOverlay}
@@ -857,6 +921,7 @@ function App() {
   const [message, setMessage] = useState("");
   const [streamReloadToken, setStreamReloadToken] = useState(0);
   const [failedStreamIds, setFailedStreamIds] = useState<Record<number, boolean>>({});
+  const [manualStreamingIds, setManualStreamingIds] = useState<Set<number>>(new Set());
   const [fullscreenCameraId, setFullscreenCameraId] = useState<number | null>(null);
   const [liveTicket, setLiveTicket] = useState("");
   const [liveClientId] = useState(() => `web-${Math.random().toString(36).slice(2, 10)}`);
@@ -866,6 +931,8 @@ function App() {
   const [dashboardFilter, setDashboardFilter] = useState<DashboardFilter>("visible");
   const [dashboardSort, setDashboardSort] = useState<DashboardSort>("custom");
   const [defaultsProviderScope, setDefaultsProviderScope] = useState<string>("ALL");
+  const isPublicZrokHost = typeof window !== "undefined" && window.location.hostname === "camcare.shares.zrok.io";
+  const maxParallelCameras = isPublicZrokHost ? 4 : Number.POSITIVE_INFINITY;
 
   useEffect(() => {
     window.localStorage.setItem("camcare_defaults_v1", JSON.stringify(defaults));
@@ -879,6 +946,15 @@ function App() {
       window.localStorage.removeItem("camcare_auth_token");
     }
   }, [authToken]);
+
+  useEffect(() => {
+    const validIds = new Set(cameras.map((camera) => camera.id));
+    setManualStreamingIds((current) => {
+      const next = new Set(Array.from(current).filter((id) => validIds.has(id)));
+      if (next.size === current.size) return current;
+      return next;
+    });
+  }, [cameras]);
 
   const onlineCount = useMemo(() => cameras.filter((camera) => camera.status === "online").length, [cameras]);
   const visibleCount = useMemo(() => cameras.filter((camera) => camera.dashboard_visible).length, [cameras]);
@@ -905,6 +981,14 @@ function App() {
       return byCustomOrder(a, b);
     });
   }, [cameras, dashboardFilter, dashboardSort]);
+  const dashboardCamerasForStreaming = useMemo(
+    () => dashboardCameras.filter((camera) => manualStreamingIds.has(camera.id)),
+    [dashboardCameras, manualStreamingIds],
+  );
+  const activeStreamingCameras = useMemo(
+    () => dashboardCamerasForStreaming.slice(0, maxParallelCameras),
+    [dashboardCamerasForStreaming, maxParallelCameras],
+  );
   const providerOptions = useMemo(() => {
     const values = new Set<string>();
     for (const camera of cameras) {
@@ -939,25 +1023,49 @@ function App() {
       });
   }, [authToken]);
 
+  const activeStreamingIds = useMemo(
+    () => new Set(activeStreamingCameras.map((camera) => camera.id)),
+    [activeStreamingCameras],
+  );
+
   const visibleCameraIdsKey = useMemo(
     () =>
-      cameras
-        .filter((camera) => camera.dashboard_visible)
+      activeStreamingCameras
         .map((camera) => camera.id)
         .sort((a, b) => a - b)
         .join(","),
-    [cameras],
+    [activeStreamingCameras],
   );
 
   useEffect(() => {
     if (!authToken || !currentUser) return;
-    const visibleIds = cameras.filter((camera) => camera.dashboard_visible).map((camera) => camera.id);
+    const visibleIds = activeStreamingCameras.map((camera) => camera.id);
     if (visibleIds.length === 0) return;
     let cancelled = false;
-    let timer: number | null = null;
+    let heartbeatTimer: number | null = null;
+    let retryTimer: number | null = null;
     let currentLiveTicket = "";
+    let bootstrapping = false;
+
+    function clearHeartbeat() {
+      if (heartbeatTimer) {
+        window.clearInterval(heartbeatTimer);
+        heartbeatTimer = null;
+      }
+    }
+
+    function scheduleRetry(ms = 2_000) {
+      if (cancelled || retryTimer) return;
+      retryTimer = window.setTimeout(() => {
+        retryTimer = null;
+        void bootstrapLiveTicket();
+      }, ms);
+    }
 
     async function bootstrapLiveTicket() {
+      if (cancelled || bootstrapping) return;
+      bootstrapping = true;
+      clearHeartbeat();
       try {
         const ticket = await api.liveTicket({
           client_id: liveClientId,
@@ -967,24 +1075,35 @@ function App() {
         if (cancelled) return;
         currentLiveTicket = ticket.live_ticket;
         setLiveTicket(currentLiveTicket);
-        timer = window.setInterval(async () => {
+        heartbeatTimer = window.setInterval(async () => {
+          if (!currentLiveTicket || cancelled) return;
           try {
             const hb = await api.liveHeartbeat(currentLiveTicket);
             currentLiveTicket = hb.live_ticket;
             if (!cancelled) setLiveTicket(currentLiveTicket);
           } catch {
-            // keep playing; ticket will be recreated on next effect run
+            if (cancelled) return;
+            setLiveTicket("");
+            currentLiveTicket = "";
+            clearHeartbeat();
+            scheduleRetry(1_500);
           }
-        }, 45_000);
+        }, 30_000);
       } catch {
-        if (!cancelled) setLiveTicket("");
+        if (!cancelled) {
+          setLiveTicket("");
+          scheduleRetry(2_500);
+        }
+      } finally {
+        bootstrapping = false;
       }
     }
 
     void bootstrapLiveTicket();
     return () => {
       cancelled = true;
-      if (timer) window.clearInterval(timer);
+      clearHeartbeat();
+      if (retryTimer) window.clearTimeout(retryTimer);
       void api.closeLiveSession(liveClientId).catch(() => undefined);
     };
   }, [authToken, currentUser, liveClientId, visibleCameraIdsKey]);
@@ -1036,6 +1155,22 @@ function App() {
     setCurrentUser(null);
     setUsers([]);
     setAuthToken("");
+  }
+
+  function enableStream(cameraId: number) {
+    setManualStreamingIds((current) => {
+      const next = new Set(current);
+      next.add(cameraId);
+      return next;
+    });
+  }
+
+  function disableStream(cameraId: number) {
+    setManualStreamingIds((current) => {
+      const next = new Set(current);
+      next.delete(cameraId);
+      return next;
+    });
   }
 
   async function runScan() {
@@ -1402,7 +1537,7 @@ function App() {
         {screen === "dashboard" ? (
           <>
             <Panel id="cameras">
-          <SectionTitle title="Cámaras" meta={`${dashboardCameras.length} visibles de ${cameras.length}`} />
+          <SectionTitle title="Cámaras" meta={`${dashboardCamerasForStreaming.length} en vivo${isPublicZrokHost ? " (límite público: 4)" : ""} · ${dashboardCameras.length} visibles · ${cameras.length} totales`} />
           <div className="dashboard-controls mb-3 flex flex-wrap items-end gap-3">
             <label>
               Mostrar
@@ -1448,6 +1583,9 @@ function App() {
                     camera={camera}
                     liveTicket={liveTicket}
                     authToken={authToken}
+                    streamEnabled={activeStreamingIds.has(camera.id)}
+                    onEnableStream={enableStream}
+                    onDisableStream={disableStream}
                     reloadToken={failedStreamIds[camera.id] ? streamReloadToken : undefined}
                     startDelayMs={Math.min(4000, ((camera.dashboard_order || camera.id) % 20) * 250)}
                     onStreamFailedChange={(cameraId, failed) =>
