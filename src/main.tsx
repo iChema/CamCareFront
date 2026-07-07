@@ -3,7 +3,6 @@ import { createPortal } from "react-dom";
 import { createRoot } from "react-dom/client";
 import Hls from "hls.js";
 import {
-  Activity,
   Camera as CameraIcon,
   Bot,
   ExternalLink,
@@ -27,6 +26,7 @@ import { api } from "./api";
 import { setApiToken } from "./api";
 import type { Camera, CameraProtocol, Health, PtzDirection, ScanResult, TelegramTarget, UserPublic } from "./types";
 import { TelegramTargetsPage } from "./components/TelegramTargetsPage";
+import { CameraSettingsCard } from "./components/CameraSettingsCard";
 import { Panel, SectionTitle } from "./components/ui";
 import { CameraCard } from "./components/CameraCard";
 import "./tailwind.css";
@@ -97,16 +97,40 @@ type GlobalDefaults = Pick<
 
 type DashboardFilter = "visible" | "all" | "hidden";
 type DashboardSort = "custom" | "name" | "status" | "provider" | "ip" | "ai";
+
+function parseDefaultsSafe(): GlobalDefaults {
+  const fallback: GlobalDefaults = {
+    dashboard_visible: true,
+    dashboard_order: 0,
+    ai_person_detection: false,
+    ai_model: "hog",
+    ai_conf_threshold: 0.3,
+    ai_fps_limit: 3,
+    ai_zone_json: "",
+    ai_min_presence_sec: 2,
+    video_filter: "",
+  };
+  try {
+    const raw = typeof window !== "undefined" ? window.localStorage.getItem("camcare_defaults_v1") : null;
+    if (!raw) return fallback;
+    const parsed = JSON.parse(raw) as Partial<GlobalDefaults>;
+    return { ...fallback, ...parsed };
+  } catch {
+    return fallback;
+  }
+}
 const CAMERA_PROVIDER_OPTIONS = ["ICSee", "O-KAM", "DVR", "Esee Cloud", "Steren", "CamCare Bridge", "Otro"] as const;
 
-function isLikelyLocalAccess() {
-  if (typeof window === "undefined") return true;
-  const host = window.location.hostname;
-  if (host === "localhost" || host === "127.0.0.1" || host === "::1") return true;
-  if (/^10\./.test(host)) return true;
-  if (/^192\.168\./.test(host)) return true;
-  if (/^172\.(1[6-9]|2[0-9]|3[0-1])\./.test(host)) return true;
-  return false;
+function isLoginErrorMessage(message: string): boolean {
+  const lower = message.toLowerCase();
+  return (
+    lower.includes("invalid") ||
+    lower.includes("error") ||
+    lower.includes("fail") ||
+    lower.includes("credencial") ||
+    lower.includes("401") ||
+    lower.includes("403")
+  );
 }
 
 function HlsVideo({
@@ -344,7 +368,6 @@ function StreamTile({
   onDisableStream?: (cameraId: number) => void;
 }) {
   const bridgeBaseUrl = "http://127.0.0.1:5090";
-  const playing = true;
   const [bridgePlaying, setBridgePlaying] = useState(false);
   const [fullscreen, setFullscreen] = useState(false);
   const [error, setError] = useState("");
@@ -467,7 +490,7 @@ function StreamTile({
   }
 
   const fullscreenOverlay =
-    fullscreen && (playing || bridgePlaying)
+    fullscreen && bridgePlaying
       ? createPortal(
           <div
             className={`internal-fullscreen ${camera.dvr_channel ? "dvr-stretch" : ""}`}
@@ -879,7 +902,10 @@ function CameraForm({
 }
 
 function App() {
-  const [authToken, setAuthToken] = useState<string>(() => window.localStorage.getItem("camcare_auth_token") ?? "");
+  // Token lives in memory only — NOT in localStorage (XSS-robable).
+  // The backend uses httpOnly cookies for auth; the token is kept in
+  // state solely for stream URL authentication during this session.
+  const [authToken, setAuthToken] = useState<string>("");
   const [currentUser, setCurrentUser] = useState<UserPublic | null>(null);
   const [loginEmail, setLoginEmail] = useState("");
   const [loginPassword, setLoginPassword] = useState("");
@@ -894,20 +920,7 @@ function App() {
   const [userModalPassword, setUserModalPassword] = useState("");
   const [userModalRole, setUserModalRole] = useState("viewer");
   const [userModalActive, setUserModalActive] = useState(true);
-  const storedDefaults =
-    typeof window !== "undefined" ? window.localStorage.getItem("camcare_defaults_v1") : null;
-  const parsedDefaults = storedDefaults ? (JSON.parse(storedDefaults) as Partial<GlobalDefaults>) : {};
-  const [defaults, setDefaults] = useState<GlobalDefaults>({
-    dashboard_visible: parsedDefaults.dashboard_visible ?? true,
-    dashboard_order: parsedDefaults.dashboard_order ?? 0,
-    ai_person_detection: parsedDefaults.ai_person_detection ?? false,
-    ai_model: parsedDefaults.ai_model ?? "hog",
-    ai_conf_threshold: parsedDefaults.ai_conf_threshold ?? 0.3,
-    ai_fps_limit: parsedDefaults.ai_fps_limit ?? 3,
-    ai_zone_json: parsedDefaults.ai_zone_json ?? "",
-    ai_min_presence_sec: parsedDefaults.ai_min_presence_sec ?? 2,
-    video_filter: parsedDefaults.video_filter ?? "",
-  });
+  const [defaults, setDefaults] = useState<GlobalDefaults>(parseDefaultsSafe);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [screen, setScreen] = useState<"dashboard" | "scan" | "settings" | "users" | "telegram">("dashboard");
@@ -940,11 +953,9 @@ function App() {
 
   useEffect(() => {
     setApiToken(authToken);
-    if (authToken) {
-      window.localStorage.setItem("camcare_auth_token", authToken);
-    } else {
-      window.localStorage.removeItem("camcare_auth_token");
-    }
+    // Token is NOT persisted to localStorage — in-memory only for this session.
+    // Clear any stale token from previous versions that did persist it.
+    window.localStorage.removeItem("camcare_auth_token");
   }, [authToken]);
 
   useEffect(() => {
@@ -982,6 +993,13 @@ function App() {
     });
   }, [cameras, dashboardFilter, dashboardSort]);
   const dashboardCamerasForStreaming = useMemo(
+    // NOTE: `manualStreamingIds` is empty by default and only grows when the
+    // user clicks "Ver live" on a tile (see `enableStream` below). This means
+    // the "X en vivo" counter starts at 0 on every fresh page load and climbs
+    // as streams are opted into. It is NOT a bug — auto-streaming every
+    // dashboard camera would saturate the LAN. If we ever want to surface
+    // "selected/active" framing for the counter, the wording should change,
+    // not the default.
     () => dashboardCameras.filter((camera) => manualStreamingIds.has(camera.id)),
     [dashboardCameras, manualStreamingIds],
   );
@@ -1157,21 +1175,27 @@ function App() {
     setAuthToken("");
   }
 
-  function enableStream(cameraId: number) {
+  const enableStream = useCallback((cameraId: number) => {
     setManualStreamingIds((current) => {
       const next = new Set(current);
       next.add(cameraId);
       return next;
     });
-  }
+  }, []);
 
-  function disableStream(cameraId: number) {
+  const disableStream = useCallback((cameraId: number) => {
     setManualStreamingIds((current) => {
       const next = new Set(current);
       next.delete(cameraId);
       return next;
     });
-  }
+  }, []);
+
+  const handleStreamFailedChange = useCallback(
+    (cameraId: number, failed: boolean) =>
+      setFailedStreamIds((prev) => ({ ...prev, [cameraId]: failed })),
+    [],
+  );
 
   async function runScan() {
     setBusy("scan");
@@ -1434,7 +1458,7 @@ function App() {
           <button className="primary" disabled={authBusy} onClick={() => void login()}>
             {authBusy ? "Entrando..." : "Iniciar sesión"}
           </button>
-          {message && <div className="message">{message}</div>}
+          {message && <div className={`message ${isLoginErrorMessage(message) ? "error" : ""}`}>{message}</div>}
         </section>
       </main>
     );
@@ -1490,7 +1514,10 @@ function App() {
             <p>DVR + cámaras por apps chinas, reunidas cuando expongan stream LAN.</p>
           </div>
           <div className="header-actions flex flex-wrap items-center justify-end gap-2">
-            <span className="pill ok">{currentUser.email} · {currentUser.role}</span>
+            <span className="pill ok user-chip" title={`${currentUser.email} · ${currentUser.role}`}>
+              <span className="user-chip__email">{currentUser.email}</span>
+              <span className="user-chip__role">· {currentUser.role}</span>
+            </span>
             {isAdmin && (
               <button className="secondary" onClick={() => setShowAddCameraModal(true)}>
                 <Plus size={16} />
@@ -1588,9 +1615,7 @@ function App() {
                     onDisableStream={disableStream}
                     reloadToken={failedStreamIds[camera.id] ? streamReloadToken : undefined}
                     startDelayMs={Math.min(4000, ((camera.dashboard_order || camera.id) % 20) * 250)}
-                    onStreamFailedChange={(cameraId, failed) =>
-                      setFailedStreamIds((prev) => ({ ...prev, [cameraId]: failed }))
-                    }
+                    onStreamFailedChange={handleStreamFailedChange}
                     fullscreenCameraId={fullscreenCameraId}
                     onFullscreenCameraChange={setFullscreenCameraId}
                   />
@@ -1846,71 +1871,11 @@ function App() {
                 <h3>Configuración individual por cámara</h3>
                 <div className="settings-camera-list">
                   {cameras.map((camera) => (
-                    <article className="camera-card settings-camera-card" key={`settings-${camera.id}`}>
-                      <div className="camera-meta">
-                        <div>
-                          <h3>{camera.name}</h3>
-                          <p>{camera.host}:{camera.port}</p>
-                        </div>
-                        <span className={`status ${camera.protocol === "cloud" ? "app_only" : camera.status}`}>
-                          {camera.protocol === "cloud" ? "cloud" : camera.status}
-                        </span>
-                      </div>
-                      <div className="form-grid settings-grid">
-                        <label>Nombre<input value={camera.name} onChange={(event) => void updateCameraConfig(camera, { name: event.target.value })} /></label>
-                        <label>Ubicación<input value={camera.location} onChange={(event) => void updateCameraConfig(camera, { location: event.target.value })} /></label>
-                        <label>
-                          Proveedor
-                          <select value={camera.provider} onChange={(event) => void updateCameraConfig(camera, { provider: event.target.value })}>
-                            <option value="">Seleccionar</option>
-                            {CAMERA_PROVIDER_OPTIONS.map((provider) => (
-                              <option key={provider} value={provider}>
-                                {provider}
-                              </option>
-                            ))}
-                          </select>
-                        </label>
-                        <label>Host<input value={camera.host} onChange={(event) => void updateCameraConfig(camera, { host: event.target.value })} /></label>
-                        <label>Puerto<input type="number" min="1" max="65535" value={camera.port} onChange={(event) => void updateCameraConfig(camera, { port: Number(event.target.value) || camera.port })} /></label>
-                        <label>Protocolo
-                          <select value={camera.protocol} onChange={(event) => void updateCameraConfig(camera, { protocol: event.target.value as CameraProtocol })}>
-                            <option value="rtsp">RTSP</option><option value="mjpeg">MJPEG</option><option value="snapshot">Snapshot</option><option value="cloud">Cloud</option><option value="unknown">Unknown</option>
-                          </select>
-                        </label>
-                        <label>Usuario<input value={camera.username} onChange={(event) => void updateCameraConfig(camera, { username: event.target.value })} /></label>
-                        <label>Password<input type="password" value={camera.password} onChange={(event) => void updateCameraConfig(camera, { password: event.target.value })} /></label>
-                        <label>Filtro video
-                          <select value={camera.video_filter} onChange={(event) => void updateCameraConfig(camera, { video_filter: event.target.value })}>
-                            <option value="">Ninguno</option><option value="crop_top_half">Top half</option><option value="crop_bottom_half">Bottom half</option>
-                          </select>
-                        </label>
-                        <label>Substream
-                          <select value={camera.use_substream ? "yes" : "no"} onChange={(event) => void updateCameraConfig(camera, { use_substream: event.target.value === "yes" })}>
-                            <option value="no">No</option><option value="yes">Sí</option>
-                          </select>
-                        </label>
-                        <label>Dashboard
-                          <select value={camera.dashboard_visible ? "show" : "hide"} onChange={(event) => void updateCameraConfig(camera, { dashboard_visible: event.target.value === "show" })}>
-                            <option value="show">Mostrar</option><option value="hide">Ocultar</option>
-                          </select>
-                        </label>
-                        <label>Orden<input type="number" min="0" max="10000" value={camera.dashboard_order} onChange={(event) => void updateCameraConfig(camera, { dashboard_order: Number(event.target.value) || 0 })} /></label>
-                        <label>IA personas
-                          <select value={camera.ai_person_detection ? "yes" : "no"} onChange={(event) => void updateCameraConfig(camera, { ai_person_detection: event.target.value === "yes" })}>
-                            <option value="no">No</option><option value="yes">Sí</option>
-                          </select>
-                        </label>
-                        <label>AI model<input value={camera.ai_model} onChange={(event) => void updateCameraConfig(camera, { ai_model: event.target.value })} /></label>
-                        <label>AI conf<input type="number" min="0" max="1" step="0.05" value={camera.ai_conf_threshold} onChange={(event) => void updateCameraConfig(camera, { ai_conf_threshold: Number(event.target.value) || 0.3 })} /></label>
-                        <label>AI fps<input type="number" min="1" max="15" value={camera.ai_fps_limit} onChange={(event) => void updateCameraConfig(camera, { ai_fps_limit: Number(event.target.value) || 3 })} /></label>
-                        <label>AI min presencia<input type="number" min="0" max="120" value={camera.ai_min_presence_sec} onChange={(event) => void updateCameraConfig(camera, { ai_min_presence_sec: Number(event.target.value) || 2 })} /></label>
-                        <label>Canal DVR<input type="number" min="1" max="128" value={camera.dvr_channel ?? ""} onChange={(event) => void updateCameraConfig(camera, { dvr_channel: event.target.value ? Number(event.target.value) : null })} /></label>
-                        <label className="wide">RTSP path<input value={camera.rtsp_path} onChange={(event) => void updateCameraConfig(camera, { rtsp_path: event.target.value })} /></label>
-                        <label className="wide">Snapshot URL<input value={camera.snapshot_url} onChange={(event) => void updateCameraConfig(camera, { snapshot_url: event.target.value })} /></label>
-                        <label className="wide">AI zone json<input value={camera.ai_zone_json} onChange={(event) => void updateCameraConfig(camera, { ai_zone_json: event.target.value })} /></label>
-                        <label className="wide">Notas<input value={camera.notes} onChange={(event) => void updateCameraConfig(camera, { notes: event.target.value })} /></label>
-                      </div>
-                    </article>
+                    <CameraSettingsCard
+                      key={`settings-${camera.id}`}
+                      camera={camera}
+                      onSave={updateCameraConfig}
+                    />
                   ))}
                 </div>
               </div>

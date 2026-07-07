@@ -26,6 +26,9 @@ export function getApiToken() {
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(`${API_BASE}${path}`, {
+    // Always send the httpOnly session cookie. The backend will use it if
+    // present, falling back to the Authorization header for backward compat.
+    credentials: "include",
     headers: {
       "Content-Type": "application/json",
       ...(authToken ? { Authorization: `Bearer ${authToken}` } : {}),

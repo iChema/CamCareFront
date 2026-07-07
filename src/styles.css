@@ -14,8 +14,8 @@ body {
   margin: 0;
   min-width: 320px;
   background:
-    linear-gradient(rgba(7, 12, 24, 0.82), rgba(7, 12, 24, 0.88)),
-    radial-gradient(circle at 70% 10%, rgba(20, 184, 166, 0.18), transparent 34rem),
+    linear-gradient(rgba(7, 12, 24, 0.93), rgba(7, 12, 24, 0.96)),
+    radial-gradient(circle at 70% 10%, rgba(20, 184, 166, 0.10), transparent 34rem),
     url("./assets/company-background.jpeg");
   background-size:
     cover,
@@ -253,6 +253,27 @@ header p {
   background: rgba(251, 146, 60, 0.1);
 }
 
+.user-chip {
+  max-width: 280px;
+  min-width: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  overflow: hidden;
+}
+
+.user-chip__email {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+.user-chip__role {
+  flex-shrink: 0;
+  opacity: 0.75;
+}
+
 .stats {
   display: grid;
   grid-template-columns: repeat(5, minmax(120px, 1fr));
@@ -263,9 +284,9 @@ header p {
 .stats div,
 .panel,
 .camera-card {
-  border: 1px solid rgba(148, 163, 184, 0.16);
-  background: rgba(16, 23, 33, 0.76);
-  box-shadow: 0 18px 55px rgba(0, 0, 0, 0.22);
+  border: 1px solid rgba(148, 163, 184, 0.22);
+  background: rgba(16, 23, 33, 0.88);
+  box-shadow: 0 18px 55px rgba(0, 0, 0, 0.32);
 }
 
 .stats div {
@@ -292,6 +313,12 @@ header p {
   border: 1px solid rgba(96, 165, 250, 0.28);
   color: #cde3ff;
   background: rgba(37, 99, 235, 0.12);
+}
+
+.message.error {
+  border-color: rgba(248, 113, 113, 0.45);
+  color: #fecaca;
+  background: rgba(127, 29, 29, 0.22);
 }
 
 .panel {
