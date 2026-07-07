@@ -2,136 +2,31 @@ import { StrictMode, useCallback, useEffect, useMemo, useRef, useState } from "r
 import { createPortal } from "react-dom";
 import { createRoot } from "react-dom/client";
 import Hls from "hls.js";
-import {
-  Camera as CameraIcon,
-  Bot,
-  ExternalLink,
-  Eye,
-  EyeOff,
-  Maximize2,
-  Menu,
-  PanelLeftClose,
-  PanelLeftOpen,
-  Plus,
-  Radar,
-  RefreshCw,
-  Settings,
-  ShieldCheck,
-  Trash2,
-  Video,
-  Wifi,
-  X,
-} from "lucide-react";
+import { ExternalLink, Eye, Maximize2, Plus, RefreshCw, X } from "lucide-react";
 import { api } from "./api";
 import { setApiToken } from "./api";
 import type { Camera, CameraProtocol, Health, PtzDirection, ScanResult, TelegramTarget, UserPublic } from "./types";
 import { TelegramTargetsPage } from "./components/TelegramTargetsPage";
-import { CameraSettingsCard } from "./components/CameraSettingsCard";
-import { Panel, SectionTitle } from "./components/ui";
 import { CameraCard } from "./components/CameraCard";
+import { DashboardScreen } from "./components/DashboardScreen";
+import { LoginScreen } from "./components/LoginScreen";
+import { ScanScreen } from "./components/ScanScreen";
+import { SettingsScreen } from "./components/SettingsScreen";
+import { Sidebar } from "./components/Sidebar";
+import { UsersScreen } from "./components/UsersScreen";
 import "./tailwind.css";
 import "./styles.css";
-
-type CameraFormPayload = {
-  name: string;
-  location: string;
-  provider: string;
-  host: string;
-  port: number;
-  protocol: CameraProtocol;
-  username: string;
-  password: string;
-  rtsp_path: string;
-  snapshot_url: string;
-  dvr_channel: number | null;
-  video_filter: string;
-  use_substream: boolean;
-  dashboard_visible: boolean;
-  dashboard_order: number;
-  ai_person_detection: boolean;
-  ai_model: string;
-  ai_conf_threshold: number;
-  ai_fps_limit: number;
-  ai_zone_json: string;
-  ai_min_presence_sec: number;
-  notes: string;
-};
-
-const emptyCamera: CameraFormPayload = {
-  name: "",
-  location: "",
-  provider: "",
-  host: "",
-  port: 554,
-  protocol: "rtsp" as const,
-  username: "",
-  password: "",
-  rtsp_path: "/Streaming/Channels/101",
-  snapshot_url: "",
-  dvr_channel: null,
-  video_filter: "",
-  use_substream: false,
-  dashboard_visible: true,
-  dashboard_order: 0,
-  ai_person_detection: false,
-  ai_model: "hog",
-  ai_conf_threshold: 0.3,
-  ai_fps_limit: 3,
-  ai_zone_json: "",
-  ai_min_presence_sec: 2,
-  notes: "",
-};
-
-type GlobalDefaults = Pick<
-  Camera,
-  | "dashboard_visible"
-  | "dashboard_order"
-  | "ai_person_detection"
-  | "ai_model"
-  | "ai_conf_threshold"
-  | "ai_fps_limit"
-  | "ai_zone_json"
-  | "ai_min_presence_sec"
-  | "video_filter"
->;
-
-type DashboardFilter = "visible" | "all" | "hidden";
-type DashboardSort = "custom" | "name" | "status" | "provider" | "ip" | "ai";
-
-function parseDefaultsSafe(): GlobalDefaults {
-  const fallback: GlobalDefaults = {
-    dashboard_visible: true,
-    dashboard_order: 0,
-    ai_person_detection: false,
-    ai_model: "hog",
-    ai_conf_threshold: 0.3,
-    ai_fps_limit: 3,
-    ai_zone_json: "",
-    ai_min_presence_sec: 2,
-    video_filter: "",
-  };
-  try {
-    const raw = typeof window !== "undefined" ? window.localStorage.getItem("camcare_defaults_v1") : null;
-    if (!raw) return fallback;
-    const parsed = JSON.parse(raw) as Partial<GlobalDefaults>;
-    return { ...fallback, ...parsed };
-  } catch {
-    return fallback;
-  }
-}
-const CAMERA_PROVIDER_OPTIONS = ["ICSee", "O-KAM", "DVR", "Esee Cloud", "Steren", "CamCare Bridge", "Otro"] as const;
-
-function isLoginErrorMessage(message: string): boolean {
-  const lower = message.toLowerCase();
-  return (
-    lower.includes("invalid") ||
-    lower.includes("error") ||
-    lower.includes("fail") ||
-    lower.includes("credencial") ||
-    lower.includes("401") ||
-    lower.includes("403")
-  );
-}
+import {
+  type CameraFormPayload,
+  type DashboardFilter,
+  type DashboardSort,
+  type GlobalDefaults,
+  type ScreenName,
+  emptyCamera,
+  isLoginErrorMessage,
+  parseDefaultsSafe,
+} from "./appTypes";
+import { CAMERA_PROVIDER_OPTIONS } from "./constants";
 
 function HlsVideo({
   sourceUrl,
@@ -1429,83 +1324,32 @@ function App() {
 
   if (!authToken || !currentUser) {
     return (
-      <main className="login-shell">
-        <section className="login-card">
-          <h1>CamCare Login</h1>
-          <p>Ingresa con tu cuenta para acceder a cámaras y configuración.</p>
-          <label>
-            Email
-            <input value={loginEmail} onChange={(event) => setLoginEmail(event.target.value)} />
-          </label>
-          <label>
-            Password
-            <div className="password-field">
-              <input
-                type={showLoginPassword ? "text" : "password"}
-                value={loginPassword}
-                onChange={(event) => setLoginPassword(event.target.value)}
-              />
-              <button
-                type="button"
-                className="icon-btn"
-                onClick={() => setShowLoginPassword((current) => !current)}
-                title={showLoginPassword ? "Ocultar password" : "Mostrar password"}
-              >
-                {showLoginPassword ? <EyeOff size={16} /> : <Eye size={16} />}
-              </button>
-            </div>
-          </label>
-          <button className="primary" disabled={authBusy} onClick={() => void login()}>
-            {authBusy ? "Entrando..." : "Iniciar sesión"}
-          </button>
-          {message && <div className={`message ${isLoginErrorMessage(message) ? "error" : ""}`}>{message}</div>}
-        </section>
-      </main>
+      <LoginScreen
+        loginEmail={loginEmail}
+        loginPassword={loginPassword}
+        showLoginPassword={showLoginPassword}
+        authBusy={authBusy}
+        message={message}
+        isLoginError={isLoginErrorMessage}
+        onEmailChange={setLoginEmail}
+        onPasswordChange={setLoginPassword}
+        onToggleShowPassword={() => setShowLoginPassword((current) => !current)}
+        onSubmit={() => void login()}
+      />
     );
   }
 
   return (
     <main className={`app-shell min-h-screen ${sidebarCollapsed ? "sidebar-collapsed" : ""}`}>
-      <button className="sidebar-mobile-toggle fixed left-2.5 top-2.5 z-[70] inline-flex h-9 w-9 items-center justify-center rounded-lg border border-slate-400/25 bg-slate-950/85 text-slate-200 md:hidden" onClick={() => setSidebarOpen((current) => !current)}>
-        <Menu size={18} />
-      </button>
-      <aside className={`sidebar ${sidebarOpen ? "open" : ""} border-r border-slate-400/20 bg-slate-950/80 backdrop-blur-xl`}>
-        <button className="sidebar-toggle ml-auto mb-2.5 inline-flex h-8 w-8 items-center justify-center rounded-lg border border-slate-400/25 bg-slate-900/70 text-slate-200" onClick={() => setSidebarCollapsed((current) => !current)}>
-          {sidebarCollapsed ? <PanelLeftOpen size={16} /> : <PanelLeftClose size={16} />}
-        </button>
-        <div className="brand">
-          <CameraIcon size={26} />
-          <div className={sidebarCollapsed ? "hide-labels" : ""}>
-            <strong>CamCare</strong>
-            <span>LAN camera hub</span>
-          </div>
-        </div>
-        <nav>
-          <button className={screen === "dashboard" ? "active" : ""} onClick={() => openScreen("dashboard")}>
-            <Video size={17} /> Dashboard
-          </button>
-          {isAdmin && (
-            <button className={screen === "scan" ? "active" : ""} onClick={() => openScreen("scan")}>
-              <Radar size={17} /> Scan LAN
-            </button>
-          )}
-          {isAdmin && (
-            <button className={screen === "users" ? "active" : ""} onClick={() => openScreen("users")}>
-              <ShieldCheck size={17} /> Usuarios
-            </button>
-          )}
-          {isAdmin && (
-            <button className={screen === "telegram" ? "active" : ""} onClick={() => openScreen("telegram")}>
-              <Bot size={17} /> Telegram
-            </button>
-          )}
-          {isAdmin && (
-            <button className={screen === "settings" ? "active" : ""} onClick={() => openScreen("settings")}>
-              <Settings size={17} /> Configuración
-            </button>
-          )}
-        </nav>
-      </aside>
+      <Sidebar
+        sidebarCollapsed={sidebarCollapsed}
+        sidebarOpen={sidebarOpen}
+        screen={screen}
+        isAdmin={isAdmin}
+        onToggleCollapsed={() => setSidebarCollapsed((current) => !current)}
+        onToggleOpen={() => setSidebarOpen((current) => !current)}
+        onOpenScreen={openScreen}
+      />
 
       <section className="content w-full px-4 pb-4 pt-14 md:px-7 md:pt-7">
         <header className="mb-4 grid grid-cols-1 gap-4 md:flex md:items-start md:justify-between">
@@ -1562,32 +1406,16 @@ function App() {
         {message && <div className="message">{message}</div>}
 
         {screen === "dashboard" ? (
-          <>
-            <Panel id="cameras">
-          <SectionTitle title="Cámaras" meta={`${dashboardCamerasForStreaming.length} en vivo${isPublicZrokHost ? " (límite público: 4)" : ""} · ${dashboardCameras.length} visibles · ${cameras.length} totales`} />
-          <div className="dashboard-controls mb-3 flex flex-wrap items-end gap-3">
-            <label>
-              Mostrar
-              <select value={dashboardFilter} onChange={(event) => setDashboardFilter(event.target.value as DashboardFilter)}>
-                <option value="visible">Solo dashboard</option>
-                <option value="all">Todas</option>
-                <option value="hidden">Ocultas</option>
-              </select>
-            </label>
-            <label>
-              Ordenar por
-              <select value={dashboardSort} onChange={(event) => setDashboardSort(event.target.value as DashboardSort)}>
-                <option value="custom">Orden custom</option>
-                <option value="name">Nombre</option>
-                <option value="status">Estado</option>
-                <option value="provider">Proveedor</option>
-                <option value="ip">IP</option>
-                <option value="ai">IA personas</option>
-              </select>
-            </label>
-          </div>
-          <div className="camera-grid grid grid-cols-1 gap-3 xl:grid-cols-3">
-            {dashboardCameras.map((camera) => (
+          <DashboardScreen
+            cameras={cameras}
+            dashboardCameras={dashboardCameras}
+            dashboardCamerasForStreaming={dashboardCamerasForStreaming}
+            dashboardFilter={dashboardFilter}
+            dashboardSort={dashboardSort}
+            isPublicZrokHost={isPublicZrokHost}
+            onFilterChange={setDashboardFilter}
+            onSortChange={setDashboardSort}
+            renderCameraCard={(camera) => (
               <CameraCard
                 key={camera.id}
                 camera={camera}
@@ -1621,111 +1449,42 @@ function App() {
                   />
                 }
               />
-            ))}
-            {dashboardCameras.length === 0 && (
-              <div className="empty">
-                <Wifi size={30} />
-                <p>Sin cámaras para este filtro. Cambia Mostrar o agrega otra cámara.</p>
-              </div>
             )}
-          </div>
-            </Panel>
-
-          </>
+          />
         ) : screen === "scan" ? (
-          isAdmin ? (
-            <section id="scan" className="panel split my-4 rounded-lg border border-slate-400/20 bg-slate-900/70 p-4 shadow-2xl">
-              <div>
-                <div className="section-title mb-3 flex items-center justify-between gap-4">
-                  <h2>Scan LAN</h2>
-                  <span>{scanResults.length} resultados</span>
-                </div>
-                <div className="scan-controls">
-                  <input value={subnet} onChange={(event) => setSubnet(event.target.value)} />
-                  <label className="checkbox">
-                    <input checked={deep} onChange={(event) => setDeep(event.target.checked)} type="checkbox" />
-                    Deep
-                  </label>
-                  <button className="primary" disabled={busy === "scan"} onClick={() => void runScan()}>
-                    <Radar size={16} />
-                    {busy === "scan" ? "Escaneando" : "Scan LAN"}
-                  </button>
-                </div>
-                <div className="results">
-                  {scanResults.map((result) => (
-                    <button className="result-row" key={result.host} onClick={() => setSelectedHost(result.host)}>
-                      <strong>{result.host}</strong>
-                      <span>{result.ports.join(", ")}</span>
-                      <small>{result.labels.join(" / ") || "device"}</small>
-                    </button>
-                  ))}
-                </div>
-              </div>
-              <div className="scan-help">
-                <h3>Rutas rápidas DVR</h3>
-                <code>/Streaming/Channels/101</code>
-                <code>/Streaming/Channels/102</code>
-                <code>/cam/realmonitor?channel=1&amp;subtype=0</code>
-                <p>Para cámaras de app: activa RTSP/ONVIF en la app o admin web si existe.</p>
-              </div>
-            </section>
-          ) : (
-            <section className="panel my-4 rounded-lg border border-slate-400/20 bg-slate-900/70 p-4 shadow-2xl">
-              <div className="empty">
-                <p>No autorizado.</p>
-              </div>
-            </section>
-          )
+          <ScanScreen
+            isAdmin={isAdmin}
+            busy={busy}
+            scanResults={scanResults}
+            subnet={subnet}
+            deep={deep}
+            onSubnetChange={setSubnet}
+            onDeepChange={setDeep}
+            onRunScan={() => void runScan()}
+            onSelectHost={setSelectedHost}
+          />
         ) : screen === "users" ? (
-          isAdmin ? (
-            <Panel id="users">
-              <SectionTitle title="Usuarios y perfiles" meta={`${users.length} usuarios`} />
-              <div className="actions">
-                <button className="secondary" onClick={() => openCreateUserModal()}>
-                  <Plus size={14} />
-                  Agregar usuario
-                </button>
-              </div>
-              <div className="users-table-wrap">
-                <table className="users-table">
-                  <thead>
-                    <tr>
-                      <th>ID</th>
-                      <th>Email</th>
-                      <th>Rol</th>
-                      <th>Estado</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {users.map((user) => {
-                      const isFirstAdmin = user.id === 1;
-                      return (
-                        <tr
-                          key={`user-${user.id}`}
-                          className={isFirstAdmin ? "locked-row" : ""}
-                          onClick={() => {
-                            if (isFirstAdmin) return;
-                            openEditUserModal(user);
-                          }}
-                        >
-                          <td>{user.id}</td>
-                          <td>{user.email}</td>
-                          <td>{user.role}</td>
-                          <td>{user.active ? "activo" : "inactivo"}</td>
-                        </tr>
-                      );
-                    })}
-                  </tbody>
-                </table>
-              </div>
-            </Panel>
-          ) : (
-            <section className="panel my-4 rounded-lg border border-slate-400/20 bg-slate-900/70 p-4 shadow-2xl">
-              <div className="empty">
-                <p>No autorizado.</p>
-              </div>
-            </section>
-          )
+          <UsersScreen
+            isAdmin={isAdmin}
+            busy={busy}
+            users={users}
+            showUserModal={showUserModal}
+            editingUserId={editingUserId}
+            userModalEmail={userModalEmail}
+            userModalPassword={userModalPassword}
+            userModalRole={userModalRole}
+            userModalActive={userModalActive}
+            currentUserId={currentUser.id}
+            onAddUser={openCreateUserModal}
+            onEditUser={openEditUserModal}
+            onCloseModal={() => setShowUserModal(false)}
+            onEmailChange={setUserModalEmail}
+            onPasswordChange={setUserModalPassword}
+            onRoleChange={setUserModalRole}
+            onActiveChange={setUserModalActive}
+            onSaveUser={() => void saveUserModal()}
+            onDeleteUser={deleteUserRow}
+          />
         ) : screen === "telegram" ? (
           isAdmin ? (
             <TelegramTargetsPage
@@ -1742,216 +1501,19 @@ function App() {
               </div>
             </section>
           )
-        ) : isAdmin ? (
-          <Panel id="settings">
-            <SectionTitle title="Configuración" meta={`${cameras.length} cámaras`} />
-            <div className="settings-layout">
-              <div className="settings-defaults">
-                <h3>Defaults globales</h3>
-                <div className="form-grid settings-grid">
-                  <label>
-                    Dashboard default
-                    <select
-                      value={defaults.dashboard_visible ? "show" : "hide"}
-                      onChange={(event) =>
-                        setDefaults((current) => ({ ...current, dashboard_visible: event.target.value === "show" }))
-                      }
-                    >
-                      <option value="show">Mostrar</option>
-                      <option value="hide">Ocultar</option>
-                    </select>
-                  </label>
-                  <label>
-                    Orden default
-                    <input
-                      type="number"
-                      min="0"
-                      max="10000"
-                      value={defaults.dashboard_order}
-                      onChange={(event) =>
-                        setDefaults((current) => ({ ...current, dashboard_order: Number(event.target.value) || 0 }))
-                      }
-                    />
-                  </label>
-                  <label>
-                    IA personas default
-                    <select
-                      value={defaults.ai_person_detection ? "yes" : "no"}
-                      onChange={(event) =>
-                        setDefaults((current) => ({ ...current, ai_person_detection: event.target.value === "yes" }))
-                      }
-                    >
-                      <option value="no">No</option>
-                      <option value="yes">Sí</option>
-                    </select>
-                  </label>
-                  <label>
-                    Video filter default
-                    <select
-                      value={defaults.video_filter}
-                      onChange={(event) => setDefaults((current) => ({ ...current, video_filter: event.target.value }))}
-                    >
-                      <option value="">Ninguno</option>
-                      <option value="crop_top_half">Top half</option>
-                      <option value="crop_bottom_half">Bottom half</option>
-                    </select>
-                  </label>
-                  <label>
-                    AI model default
-                    <input
-                      value={defaults.ai_model}
-                      onChange={(event) => setDefaults((current) => ({ ...current, ai_model: event.target.value }))}
-                    />
-                  </label>
-                  <label>
-                    AI conf default
-                    <input
-                      type="number"
-                      min="0"
-                      max="1"
-                      step="0.05"
-                      value={defaults.ai_conf_threshold}
-                      onChange={(event) =>
-                        setDefaults((current) => ({ ...current, ai_conf_threshold: Number(event.target.value) || 0.3 }))
-                      }
-                    />
-                  </label>
-                  <label>
-                    AI fps default
-                    <input
-                      type="number"
-                      min="1"
-                      max="15"
-                      value={defaults.ai_fps_limit}
-                      onChange={(event) =>
-                        setDefaults((current) => ({ ...current, ai_fps_limit: Number(event.target.value) || 3 }))
-                      }
-                    />
-                  </label>
-                  <label>
-                    AI min presencia default (s)
-                    <input
-                      type="number"
-                      min="0"
-                      max="120"
-                      value={defaults.ai_min_presence_sec}
-                      onChange={(event) =>
-                        setDefaults((current) => ({ ...current, ai_min_presence_sec: Number(event.target.value) || 2 }))
-                      }
-                    />
-                  </label>
-                  <label className="wide">
-                    AI zone default (json)
-                    <input
-                      value={defaults.ai_zone_json}
-                      onChange={(event) => setDefaults((current) => ({ ...current, ai_zone_json: event.target.value }))}
-                    />
-                  </label>
-                  <label>
-                    Aplicar sobre proveedor
-                    <select value={defaultsProviderScope} onChange={(event) => setDefaultsProviderScope(event.target.value)}>
-                      <option value="ALL">Todos</option>
-                      {providerOptions.map((provider) => (
-                        <option key={provider} value={provider}>
-                          {provider}
-                        </option>
-                      ))}
-                    </select>
-                  </label>
-                </div>
-                <div className="actions">
-                  <button className="secondary" disabled={busy === "defaults-all"} onClick={() => void applyDefaultsToAll()}>
-                    {defaultsProviderScope === "ALL"
-                      ? "Aplicar defaults a todas"
-                      : `Aplicar defaults a ${defaultsProviderScope}`}
-                  </button>
-                </div>
-              </div>
-              <div className="settings-cameras">
-                <h3>Configuración individual por cámara</h3>
-                <div className="settings-camera-list">
-                  {cameras.map((camera) => (
-                    <CameraSettingsCard
-                      key={`settings-${camera.id}`}
-                      camera={camera}
-                      onSave={updateCameraConfig}
-                    />
-                  ))}
-                </div>
-              </div>
-            </div>
-          </Panel>
         ) : (
-          <section className="panel my-4 rounded-lg border border-slate-400/20 bg-slate-900/70 p-4 shadow-2xl">
-            <div className="empty">
-              <p>No autorizado.</p>
-            </div>
-          </section>
-        )}
-        {isAdmin && showUserModal && (
-          <div className="modal-backdrop" role="presentation" onClick={() => setShowUserModal(false)}>
-            <div className="modal-card" role="dialog" aria-modal="true" aria-label="Usuario" onClick={(event) => event.stopPropagation()}>
-              <div className="section-title mb-3 flex items-center justify-between gap-4">
-                <h2>{editingUserId === null ? "Agregar usuario" : `Editar usuario #${editingUserId}`}</h2>
-                <button className="secondary" onClick={() => setShowUserModal(false)}>
-                  <X size={14} />
-                  Cerrar
-                </button>
-              </div>
-              <div className="form-grid settings-grid">
-                <label>
-                  Email
-                  <input value={userModalEmail} onChange={(event) => setUserModalEmail(event.target.value)} />
-                </label>
-                <label>
-                  Password {editingUserId !== null && <small>(opcional)</small>}
-                  <input
-                    type="password"
-                    value={userModalPassword}
-                    onChange={(event) => setUserModalPassword(event.target.value)}
-                    disabled={editingUserId === 1}
-                  />
-                </label>
-                <label>
-                  Rol
-                  <select
-                    value={userModalRole}
-                    onChange={(event) => setUserModalRole(event.target.value)}
-                    disabled={editingUserId === 1}
-                  >
-                    <option value="viewer">viewer</option>
-                    <option value="admin">admin</option>
-                  </select>
-                </label>
-                <label>
-                  Activo
-                  <select
-                    value={userModalActive ? "yes" : "no"}
-                    onChange={(event) => setUserModalActive(event.target.value === "yes")}
-                    disabled={editingUserId === 1}
-                  >
-                    <option value="yes">Sí</option>
-                    <option value="no">No</option>
-                  </select>
-                </label>
-              </div>
-              <div className="actions">
-                <button className="secondary" disabled={busy === "user-modal" || editingUserId === 1} onClick={() => void saveUserModal()}>
-                  Guardar
-                </button>
-                {editingUserId !== null && (
-                  <button
-                    className="danger"
-                    disabled={busy === `user-del-${editingUserId}` || editingUserId === currentUser.id || editingUserId === 1}
-                    onClick={() => void deleteUserRow(editingUserId)}
-                  >
-                    Eliminar
-                  </button>
-                )}
-              </div>
-              {editingUserId === 1 && <div className="message">El primer admin no se puede editar.</div>}
-            </div>
-          </div>
+          <SettingsScreen
+            isAdmin={isAdmin}
+            busy={busy}
+            cameras={cameras}
+            defaults={defaults}
+            defaultsProviderScope={defaultsProviderScope}
+            providerOptions={providerOptions}
+            onDefaultsChange={setDefaults}
+            onProviderScopeChange={setDefaultsProviderScope}
+            onApplyDefaultsToAll={() => void applyDefaultsToAll()}
+            onUpdateCameraConfig={updateCameraConfig}
+          />
         )}
         {isAdmin && showAddCameraModal && (
           <div className="modal-backdrop" role="presentation" onClick={() => setShowAddCameraModal(false)}>
